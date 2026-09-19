@@ -34,8 +34,9 @@ $OutDir   = if ($env:ProgramData) { Join-Path $env:ProgramData 'OESU' } else { J
 $Report   = Join-Path $OutDir 'changed-since.csv'
 
 $SinceRaw = if ($env:SinceUtc) { $env:SinceUtc } else { '2026-09-12T00:00:00Z' }
-$RootsRaw = if ($env:ScanRoots) { $env:ScanRoots } else { 'C:\Data' }
+$RootsRaw = if ($env:ScanRoots) { $env:ScanRoots } else { '' }
 $TopN     = if ($env:TopN) { [int]$env:TopN } else { 40 }
+$Depth    = if ($env:Depth) { [int]$env:Depth } else { 2 }
 
 $Since = [datetime]::MinValue
 $styles = [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal
@@ -53,7 +54,38 @@ Write-Host " counting files modified after: $($Since.ToString('yyyy-MM-dd HH:mm:
 Write-Host '======================================================================='
 Write-Host ''
 
-$roots = @($RootsRaw -split ';' | ForEach-Object { $_.Trim().TrimEnd('\') } | Where-Object { $_ })
+# Where to look. With no ScanRoots given, ask the server what it actually shares
+# rather than assuming a path. Scanning what we THINK is there is how you miss a
+# folder users map every day.
+$shareInfo = @()
+try {
+    $shareInfo = @(Get-SmbShare -ErrorAction Stop | Where-Object {
+        $_.Name -notmatch '\$$' -and
+        @('NETLOGON','SYSVOL','CertEnroll') -notcontains $_.Name -and
+        $_.Path
+    })
+} catch {
+    Write-Host "  (could not enumerate shares: $($_.Exception.Message))"
+}
+
+if ($shareInfo.Count -gt 0) {
+    Write-Host 'SHARES SERVED BY THIS MACHINE:'
+    $shareInfo | Select-Object Name, Path | Format-Table -AutoSize | Out-String -Width 240 | Write-Host
+    foreach ($s in $shareInfo) { Write-Host ("SHARE|{0}|{1}|{2}" -f $Computer, $s.Name, $s.Path) }
+    Write-Host ''
+}
+
+if ($RootsRaw) {
+    $roots = @($RootsRaw -split ';' | ForEach-Object { $_.Trim().TrimEnd('\') } | Where-Object { $_ })
+} elseif ($shareInfo.Count -gt 0) {
+    $roots = @($shareInfo | ForEach-Object { $_.Path.TrimEnd('\') } | Sort-Object -Unique)
+    Write-Host ("No ScanRoots given, so scanning the {0} shared path(s) listed above." -f $roots.Count)
+    Write-Host ''
+} else {
+    $roots = @('C:\Data')
+    Write-Host 'No ScanRoots given and no shares readable. Falling back to C:\Data.'
+    Write-Host ''
+}
 
 $changed   = New-Object System.Collections.Generic.List[object]
 $totalAll  = 0
@@ -79,8 +111,11 @@ foreach ($root in $roots) {
 
             # split on either separator so grouping is correct regardless of platform
             $rel = $_.FullName.Substring($root.Length).TrimStart('\', '/')
-            $top = ($rel -split '[\\/]')[0]
-            if (-not $top) { $top = '(files at root)' }
+            $parts = @($rel -split '[\\/]')
+            # group $Depth levels deep. users\Shared Accounting and users\Sonya.McLam
+            # are different things; rolling them into "users" hides the answer.
+            $keep = [Math]::Min($Depth, $parts.Count - 1)
+            $top = if ($keep -le 0) { '(files at root)' } else { ($parts[0..($keep-1)]) -join '\' }
             if (-not $perFolder.ContainsKey($top)) {
                 $perFolder[$top] = [pscustomobject]@{ Folder = $top; Files = 0; Bytes = [int64]0 }
             }
