@@ -1,7 +1,17 @@
 <#
 =======================================================================
  OESU-Freeze.ps1
- Version 1.0  (2026-09-19)
+ Version 1.1  (2026-09-19)
+
+ 1.1  Prefer drivefs-results-<stamp>.csv over the transcript as the
+      verification source. Sync-SharedDrives writes that CSV as the last
+      thing it does, after the verify pass, so a CSV carrying this run's
+      stamp is proof the run finished. The 17:15 run on 2026-09-19 copied
+      all 498 files and wrote its results, but its transcript was still
+      sitting unflushed in an open PowerShell window, which is
+      indistinguishable from a run still in progress. v1.0 refused, which
+      was the right call on the evidence it had. This version reads the
+      better evidence.
 
  Freezes migrated server folders read only, running as SYSTEM through
  the OESU - Run Script launcher. No console session, no RDP.
@@ -21,14 +31,19 @@
  in that run.
 
  THE SAFETY RULES, IN ORDER
-   1. It reads the NEWEST drivefs-sync-*-transcript.txt.
-   2. If that transcript is older than MaxAgeHours, it refuses
+   1. It finds the NEWEST drivefs-sync-*-transcript.txt and takes that
+      run's stamp. If drivefs-results-<stamp>.csv exists, that is the
+      verification source, because the sync writes it only after
+      verifying. Otherwise it falls back to reading the transcript, and
+      then insists on the transcript's end marker, since without the CSV
+      that is the only evidence the run is not still going.
+   2. If the source it used is older than MaxAgeHours, it refuses
       everything. Stale proof is not proof.
-   3. If that transcript looks like a run still in progress, it refuses
-      everything, so it can never freeze a folder mid-copy.
-   4. A folder is frozen only if the transcript says
-      "Still different after copy: 0". Anything else is skipped and
-      named in the report.
+   3. If it had to fall back to the transcript and that transcript looks
+      like a run still in progress, it refuses everything, so it can
+      never freeze a folder mid-copy.
+   4. A folder is frozen only if its run reported zero files still
+      different. Anything else is skipped and named in the report.
    5. A folder with files open is skipped unless Force is true.
    6. Every folder's ACL is saved before it is touched.
    7. Nothing is ever deleted.
@@ -62,7 +77,7 @@
 $ErrorActionPreference = 'Continue'
 
 $Computer = $env:COMPUTERNAME
-$Version  = '1.0'
+$Version  = '1.1'
 $Stamp    = Get-Date -Format 'yyyyMMdd-HHmm'
 
 $Out        = if ($env:Out)     { $env:Out.TrimEnd('\') } else { 'C:\Migration' }
@@ -149,36 +164,77 @@ $tx = @(Get-ChildItem -LiteralPath $Out -Filter 'drivefs-sync-*-transcript.txt' 
         Sort-Object LastWriteTimeUtc -Descending)
 if ($tx.Count -eq 0) { Stop-Now "No drivefs-sync transcript in $Out. Nothing has been verified." 'notranscript' }
 
-$latest  = $tx[0]
-$ageHrs  = ((Get-Date).ToUniversalTime() - $latest.LastWriteTimeUtc).TotalHours
-Say "Verification source : $($latest.Name)"
-Say ("Written             : {0} UTC  ({1:N1} hours ago)" -f $latest.LastWriteTimeUtc.ToString('yyyy-MM-dd HH:mm'), $ageHrs)
+$latest = $tx[0]
 
-if ($ageHrs -gt $MaxAge) {
-    Stop-Now ("That transcript is {0:N1} hours old and MaxAgeHours is {1}. Rerun the sync before freezing." -f $ageHrs, $MaxAge) 'stale'
-}
+# The run stamp: drivefs-sync-20260919-1715-transcript.txt -> 20260919-1715.
+# Sync-SharedDrives writes drivefs-results-<stamp>.csv as the LAST thing it does,
+# after the verify pass, so a results CSV carrying this run's stamp is proof the
+# run finished. It is also better evidence than the transcript: structured, with
+# an explicit StillDifferent column, and not subject to transcript buffering.
+# On 2026-09-19 a finished run left its transcript unflushed because the window
+# was still open, which reads exactly like a run still in progress.
+$runStamp = ''
+if ($latest.Name -match 'drivefs-sync-(.+?)-transcript\.txt$') { $runStamp = $Matches[1] }
 
-$lines = @(Get-Content -LiteralPath $latest.FullName -ErrorAction SilentlyContinue)
-if ($lines.Count -eq 0) { Stop-Now 'The transcript is empty.' 'emptytranscript' }
+$verified  = @{}
+$usedCsv   = $false
+$source    = $latest
 
-# A finished PowerShell transcript ends with its own end banner. If it does not,
-# the sync is very likely still running and nothing here is safe to trust yet.
-$tail = ($lines[-6..-1] -join "`n")
-if ($tail -notmatch 'Windows PowerShell transcript end') {
-    Stop-Now 'That transcript has no end marker, so the sync looks like it is still running. Wait for it to finish.' 'running'
-}
-
-# Parse: "== <Name>  (n files, x GB)  <src>  to  <dst>" then later
-#        "  Still different after copy: <n>   Status: ..."
-$verified = @{}
-$current  = $null
-foreach ($ln in $lines) {
-    if ($ln -match '^\s*==\s+(.+?)\s{2,}\(') { $current = $Matches[1].Trim(); continue }
-    if ($current -and $ln -match 'Still different after copy:\s*(\d+)') {
-        $verified[$current] = [int]$Matches[1]
-        $current = $null
+if ($runStamp) {
+    $csvPath = Join-Path $Out ("drivefs-results-{0}.csv" -f $runStamp)
+    if (Test-Path -LiteralPath $csvPath) {
+        $rows = @()
+        try { $rows = @(Import-Csv -LiteralPath $csvPath -ErrorAction Stop) } catch { $rows = @() }
+        $cols = if ($rows.Count -gt 0) { @($rows[0].PSObject.Properties.Name) } else { @() }
+        if (($cols -contains 'SharedDrive') -and ($cols -contains 'StillDifferent')) {
+            foreach ($r in $rows) {
+                $n = "$($r.SharedDrive)".Trim()
+                $d = "$($r.StillDifferent)".Trim()
+                if ($n -and $d -match '^\d+$') { $verified[$n] = [int]$d }
+            }
+            $usedCsv = $true
+            $source  = Get-Item -LiteralPath $csvPath
+        }
+        else {
+            Say "Ignoring $(Split-Path -Leaf $csvPath): no SharedDrive/StillDifferent columns."
+            $verified = @{}
+        }
     }
 }
+
+Say ("Verification source : {0}" -f $(if ($usedCsv) { 'results CSV (written after the verify pass, so the run finished)' } else { 'sync transcript' }))
+Say "File                : $($source.Name)"
+$ageHrs = ((Get-Date).ToUniversalTime() - $source.LastWriteTimeUtc).TotalHours
+Say ("Written             : {0} UTC  ({1:N1} hours ago)" -f $source.LastWriteTimeUtc.ToString('yyyy-MM-dd HH:mm'), $ageHrs)
+
+if ($ageHrs -gt $MaxAge) {
+    Stop-Now ("That is {0:N1} hours old and MaxAgeHours is {1}. Rerun the sync before freezing." -f $ageHrs, $MaxAge) 'stale'
+}
+
+if (-not $usedCsv) {
+    $lines = @(Get-Content -LiteralPath $latest.FullName -ErrorAction SilentlyContinue)
+    if ($lines.Count -eq 0) { Stop-Now 'The transcript is empty.' 'emptytranscript' }
+
+    # A finished PowerShell transcript ends with its own end banner. With no
+    # results CSV for this run, that marker is the only evidence the sync is not
+    # still going, so without it nothing here is safe to trust.
+    $tail = ($lines[-6..-1] -join "`n")
+    if ($tail -notmatch 'Windows PowerShell transcript end') {
+        Stop-Now 'That transcript has no end marker and the run wrote no results CSV, so the sync looks like it is still running. Wait for it to finish.' 'running'
+    }
+
+    # Parse: "== <Name>  (n files, x GB)  <src>  to  <dst>" then later
+    #        "  Still different after copy: <n>   Status: ..."
+    $current = $null
+    foreach ($ln in $lines) {
+        if ($ln -match '^\s*==\s+(.+?)\s{2,}\(') { $current = $Matches[1].Trim(); continue }
+        if ($current -and $ln -match 'Still different after copy:\s*(\d+)') {
+            $verified[$current] = [int]$Matches[1]
+            $current = $null
+        }
+    }
+}
+
 Say "Folders reported in that run : $($verified.Count)"
 Say ''
 
