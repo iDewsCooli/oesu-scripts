@@ -1,7 +1,7 @@
 <#
 =======================================================================
  OESU-Personal-Move.ps1
- Version 1.0  (2026-09-20)
+ Version 1.1  (2026-09-21)
 
  Moves ONE person's home folder from OESU2019 into their own My Drive,
  then freezes the server copy. Built from the September 11 procedure
@@ -70,6 +70,11 @@ param(
     # Server hosting the home folders.
     [string]$Server = 'OESU2019',
 
+    # Override the share and path under it that holds the home folders, for
+    # example "Data\users". Normally worked out by probing the server, because
+    # OESU2019 publishes one data share called Data with users inside it.
+    [string]$Share,
+
     # Override the source folder. Normally worked out from the signed in account.
     [string]$Source,
 
@@ -99,7 +104,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$Version = '1.0'
+$Version = '1.1'
 $Stamp   = Get-Date -Format 'yyyyMMdd-HHmm'
 
 # Files that never belong in the Drive copy. Thumbs.db and desktop.ini are
@@ -378,10 +383,37 @@ if ($Source) {
     $src = $Source
     Say "Source override : $src"
 } else {
-    $share = "\\$Server\users"
-    if (-not (Test-Path -LiteralPath $share)) {
-        Stop-Now "Cannot reach $share. Check the server is up and you are on the network or VPN." 'noshare'
+    # OESU2019 publishes exactly one data share, Data, mapped to C:\Data, and
+    # the home folders sit in C:\Data\users. Verified on the server 2026-09-21.
+    # The other candidates are here so a differently laid out server still
+    # works without editing this file. First one that answers wins.
+    $sep     = [IO.Path]::DirectorySeparatorChar
+    $srvRoot = "\\$Server"
+    $roots   = @()
+    if ($Share) { $roots += ($srvRoot + $sep + (($Share -split '[\\/]') -join $sep)) }
+    foreach ($parts in @(@('Data','users'), @('users'), @('Data'))) {
+        $roots += ($srvRoot + $sep + ($parts -join $sep))
     }
+
+    $share = $null
+    foreach ($r in $roots) {
+        if (Test-Path -LiteralPath $r) { $share = $r; break }
+    }
+
+    if (-not $share) {
+        $here = ''
+        try {
+            $ips = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+                     Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
+                     Select-Object -ExpandProperty IPAddress)
+            if ($ips.Count -gt 0) { $here = " This PC is on $($ips -join ', ')." }
+        } catch { }
+        Stop-Now ("Cannot reach the home folders on $Server. Tried: " + ($roots -join ', ') +
+                  ". Either the server is down, or this PC is not on the OESU network." + $here +
+                  " Connect to the OESU network or the VPN and run this again.") 'noshare'
+    }
+
+    Say "Home folders at : $share"
     $cands = @(Get-ChildItem -LiteralPath $share -Directory -ErrorAction SilentlyContinue |
                Where-Object { ($_.Name -replace '[._-]','') -eq ($me -replace '[._-]','') })
     if ($cands.Count -eq 0) {
