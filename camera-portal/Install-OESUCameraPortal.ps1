@@ -2,7 +2,7 @@
 <#
 .SYNOPSIS
   OESU Camera Portal on OESU2019: Apache (Apache Lounge build) for HTTPS, oauth2-proxy for Google sign-in,
-  reachable from the Central Office LAN only. Version 1.0.0, October 5, 2026.
+  reachable from the Central Office LAN only. Version 1.0.1, October 5, 2026 (1.0.1 fixes file permissions).
 
 .DESCRIPTION
   Modes (parameter -Mode or environment variable Mode, as passed by the Datto "OESU - Run Script" launcher):
@@ -48,7 +48,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$ScriptVersion = '1.0.0'
+$ScriptVersion = '1.0.1'
 
 function Pick([string]$a, [string]$envName, [string]$default) {
   if ($a) { return $a }
@@ -429,20 +429,44 @@ SSLSessionCacheTimeout 300
   [IO.File]::WriteAllText((Join-Path $ConfDir 'httpd.conf'), $conf, (New-Object Text.UTF8Encoding($false)))
 }
 
+# icacls rule learned the hard way (1.0.0): inheritance flags such as (OI)(CI) are only valid on folders. Given to a file
+# together with /inheritance:r, icacls drops the grant silently, exits 0 and leaves the file with an EMPTY DACL (no one,
+# not even SYSTEM, can open it). So: set inheritable ACEs on folders only, never with /T, and let files inherit.
+function Reset-Children {
+  # Make every file and folder under $Root inherit from its parent again. Also repairs files left with empty DACLs.
+  if (-not (Test-Path $Root)) { return }
+  $takeown = Join-Path $Sys32 'takeown.exe'
+  if (Test-Path $takeown) { Invoke-Native $takeown @('/F', $Root, '/R', '/A', '/D', 'Y') -AllowFail | Out-Null }
+  if (Get-ChildItem -Path $Root -Force -ErrorAction SilentlyContinue | Select-Object -First 1) {
+    Invoke-Native $Icacls @((Join-Path $Root '*'), '/reset', '/T', '/C', '/Q') -AllowFail | Out-Null
+  }
+}
+
 function Set-Acls {
-  Invoke-Native $Icacls @($Root, '/inheritance:r', '/grant:r', "${SID_SYSTEM}:(OI)(CI)F", "${SID_ADMINS}:(OI)(CI)F", "${SID_LOCALSVC}:(OI)(CI)RX", '/T', '/C', '/Q') | Out-Null
-  Invoke-Native $Icacls @($LogDir, '/grant', "${SID_LOCALSVC}:(OI)(CI)M", '/T', '/C', '/Q') | Out-Null
+  # Root folder: SYSTEM and Administrators full control, LocalService read and execute, inherited by everything below.
+  Invoke-Native $Icacls @($Root, '/inheritance:r', '/grant:r', "${SID_SYSTEM}:(OI)(CI)F", "${SID_ADMINS}:(OI)(CI)F", "${SID_LOCALSVC}:(OI)(CI)RX", '/C', '/Q') | Out-Null
+  Reset-Children
+  foreach ($d in @($LogDir, (Join-Path $ApacheDir 'logs'))) {
+    if (Test-Path $d) { Invoke-Native $Icacls @($d, '/grant', "${SID_LOCALSVC}:(OI)(CI)M", '/C', '/Q') | Out-Null }
+  }
   foreach ($d in @($SecretDir, $SslDir, $Staging)) {
     if (Test-Path $d) {
-      Invoke-Native $Icacls @($d, '/inheritance:r', '/grant:r', "${SID_SYSTEM}:(OI)(CI)F", "${SID_ADMINS}:(OI)(CI)F", '/T', '/C', '/Q') | Out-Null
-      Invoke-Native $Icacls @($d, '/remove:g', $SID_LOCALSVC, '/T', '/C', '/Q') | Out-Null
+      Invoke-Native $Icacls @($d, '/inheritance:r', '/grant:r', "${SID_SYSTEM}:(OI)(CI)F", "${SID_ADMINS}:(OI)(CI)F", '/C', '/Q') | Out-Null
+      Invoke-Native $Icacls @($d, '/remove:g', $SID_LOCALSVC, '/C', '/Q') -AllowFail | Out-Null
     }
   }
-  # Apache must read the key and oauth2-proxy must read its config, and nothing else gets them.
+  # Apache must read the certificate and key, oauth2-proxy must read its config, and nothing else gets them. Files: no inheritance flags.
   foreach ($f in @((Join-Path $SslDir "$Hostname.key"), (Join-Path $SslDir "$Hostname.crt"), (Join-Path $ConfDir 'oauth2-proxy.cfg'))) {
     if (Test-Path $f) { Invoke-Native $Icacls @($f, '/inheritance:r', '/grant:r', "${SID_SYSTEM}:F", "${SID_ADMINS}:F", "${SID_LOCALSVC}:R", '/C', '/Q') | Out-Null }
   }
-  Invoke-Native $Icacls @($SslDir, '/grant', "${SID_LOCALSVC}:RX", '/C', '/Q') | Out-Null
+  # LocalService may open the ssl folder (this folder only) to reach those two files.
+  if (Test-Path $SslDir) { Invoke-Native $Icacls @($SslDir, '/grant', "${SID_LOCALSVC}:RX", '/C', '/Q') | Out-Null }
+  # Self check: the files Apache and the installer need must be readable.
+  foreach ($f in @((Join-Path $ApacheDir 'bin\httpd.exe'), (Join-Path $ConfDir 'httpd.conf'), (Join-Path $SslDir "$Hostname.key"))) {
+    if (Test-Path $f) {
+      try { $fs = [IO.File]::OpenRead($f); $fs.Close() } catch { throw "Permission check failed on $f after setting ACLs: $($_.Exception.Message)" }
+    }
+  }
 }
 
 function New-PortalCert {
@@ -642,6 +666,7 @@ try {
   New-Item -ItemType Directory -Force -Path $Root, $Staging | Out-Null
   # Lock the folder before anything is downloaded into it (C:\ inheritance would give Authenticated Users modify).
   Invoke-Native $Icacls @($Root, '/inheritance:r', '/grant:r', "${SID_SYSTEM}:(OI)(CI)F", "${SID_ADMINS}:(OI)(CI)F", '/C', '/Q') | Out-Null
+  Reset-Children   # repairs files a 1.0.0 run left unreadable, before anything is hashed or replaced
 
   Head 'Server'
   $os = Get-CimInstance Win32_OperatingSystem
@@ -768,7 +793,6 @@ try {
   }
   Write-ApacheConfig $ip $AllowedNet
   Set-Acls
-  Invoke-Native $Icacls @((Join-Path $ApacheDir 'logs'), '/grant', "${SID_LOCALSVC}:(OI)(CI)M", '/C', '/Q') -AllowFail | Out-Null
   $test = Invoke-Native (Join-Path $ApacheDir 'bin\httpd.exe') @('-t', '-f', (Join-Path $ConfDir 'httpd.conf')) -AllowFail
   if ($test -notmatch 'Syntax OK') { throw ('Apache config test failed: ' + $test.Trim()) }
   Say '  Apache config test: Syntax OK'
