@@ -1,7 +1,7 @@
 <#
 =======================================================================
  OESU-AcrobatReader.ps1
- Version 1.0  (2026-10-22)
+ Version 1.1  (2026-10-22)
 
  Diagnoses and repairs the "Adobe can't save PDFs / keeps asking me to
  sign in" problem seen at OESU in Sept and Oct 2026 (Jen in HR, Mae,
@@ -48,9 +48,9 @@
                     Default false: leave Adobe's updater running until
                     Datto is managing Adobe versions. If you set this
                     true, Datto must push Adobe security updates.
-   InstallerUrl     Reinstall. Override the Reader installer URL.
-                    Default is the 26.002.22031 64-bit MUI enterprise
-                    installer on ardownload2.adobe.com.
+   InstallerUrl     Reinstall. Extra installer URL to try first.
+                    The script then falls back through the known
+                    full 64-bit Reader MUI installers on ardownload2/3.
    KeepIfReader     Reinstall. Default true: if Check already shows
                     Reader mode (SCAPackageLevel 1) the reinstall is
                     skipped and only Lock runs. Set false to force it.
@@ -67,7 +67,7 @@
 $ErrorActionPreference = "Continue"
 
 $ScriptName = "OESU-AcrobatReader"
-$Version    = "1.0"
+$Version    = "1.1"
 $Dir        = "C:\ProgramData\OESU"
 $Log        = Join-Path $Dir "AcrobatReader.log"
 $Computer   = $env:COMPUTERNAME
@@ -96,9 +96,17 @@ if (-not $Mode) {
 $WhatIf         = ($env:WhatIf -eq "true")
 $DisableUpdater = ($env:DisableUpdater -eq "true")
 $KeepIfReader   = -not ($env:KeepIfReader -eq "false")
-$InstallerUrl   = if ($env:InstallerUrl) { $env:InstallerUrl.Trim() } else {
-    "https://ardownload2.adobe.com/pub/adobe/reader/win/AcrobatDC/2600222031/AcroRdrDCx642600222031_MUI.exe"
-}
+# Full 64-bit Reader MUI installers live under /pub/adobe/acrobat/win/ (not /reader/),
+# which only holds the .msp patches. Candidates are tried in order; the first one that
+# downloads and carries a valid Adobe signature wins. InstallerUrl, if set, goes first.
+$InstallerCandidates = @(
+    "https://ardownload2.adobe.com/pub/adobe/acrobat/win/AcrobatDC/2600222031/AcroRdrDCx642600222031_MUI.exe",
+    "https://ardownload3.adobe.com/pub/adobe/acrobat/win/AcrobatDC/2600222031/AcroRdrDCx642600222031_MUI.exe",
+    "https://ardownload2.adobe.com/pub/adobe/acrobat/win/AcrobatDC/2600221869/AcroRdrDCx642600221869_MUI.exe",
+    "https://ardownload2.adobe.com/pub/adobe/acrobat/win/AcrobatDC/2600221869/AcroRdrDCx642600221869_en_US.exe"
+)
+if ($env:InstallerUrl) { $InstallerCandidates = @($env:InstallerUrl.Trim()) + $InstallerCandidates }
+$InstallerUrl = $InstallerCandidates[0]
 
 Write-Host "======================================================================="
 Write-Host " $ScriptName v$Version   mode: $Mode$(if ($WhatIf) { ' (WHATIF, nothing will change)' })"
@@ -355,21 +363,38 @@ function Do-Reinstall {
 
     # 1. Download the installer first, so a failed download never leaves the PC with no PDF reader.
     $dl = Join-Path $Dir ("AcroRdr_" + (Get-Date -Format 'yyyyMMddHHmm') + ".exe")
-    if (Would "Download Reader installer from $InstallerUrl") {
-        try {
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -Uri $InstallerUrl -OutFile $dl -UseBasicParsing -TimeoutSec 900
-        } catch {
-            L "Download failed: $($_.Exception.Message)"
-            Write-Host "RESULT|$Computer|reinstall|failed|download"
-            exit 1
+    if (Would "Download a Reader installer (trying $($InstallerCandidates.Count) known URL(s) in order)") {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $got = $false
+        foreach ($url in $InstallerCandidates) {
+            L "Trying $url"
+            Remove-Item $dl -Force -ErrorAction SilentlyContinue
+            try {
+                Invoke-WebRequest -Uri $url -OutFile $dl -UseBasicParsing -TimeoutSec 900
+            } catch {
+                L "  download failed: $($_.Exception.Message)"
+                continue
+            }
+            $size = (Get-Item $dl -ErrorAction SilentlyContinue).Length
+            if (-not $size -or $size -lt 100MB) {
+                L "  file is only $size bytes, not a full installer; skipping"
+                continue
+            }
+            $sig = Get-AuthenticodeSignature -FilePath $dl
+            $signer = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { "none" }
+            L ("  signature: {0}  signer: {1}  size: {2:N0} bytes" -f $sig.Status, $signer, $size)
+            if ($sig.Status -ne "Valid" -or $signer -notmatch 'Adobe') {
+                L "  not validly signed by Adobe; skipping"
+                continue
+            }
+            $InstallerUrl = $url
+            $got = $true
+            Write-Host "ACTION|$Computer|did|Downloaded and verified $url"
+            break
         }
-        $sig = Get-AuthenticodeSignature -FilePath $dl
-        $signer = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { "none" }
-        L ("Installer signature: {0}  signer: {1}" -f $sig.Status, $signer)
-        if ($sig.Status -ne "Valid" -or $signer -notmatch 'Adobe') {
-            L "Installer is not validly signed by Adobe. Stopping before any uninstall."
-            Write-Host "RESULT|$Computer|reinstall|failed|bad_signature"
+        if (-not $got) {
+            L "No candidate installer could be downloaded and verified. Stopping before any uninstall. Pass InstallerUrl to override."
+            Write-Host "RESULT|$Computer|reinstall|failed|download"
             Remove-Item $dl -Force -ErrorAction SilentlyContinue
             exit 1
         }
