@@ -1,7 +1,7 @@
 <#
 =======================================================================
  OESU-AcrobatReader.ps1
- Version 1.2  (2026-10-22)
+ Version 1.3  (2026-10-22)
 
  Diagnoses and repairs the "Adobe can't save PDFs / keeps asking me to
  sign in" problem seen at OESU in Sept and Oct 2026 (Jen in HR, Mae,
@@ -36,6 +36,9 @@
               (Acrobat is closed by force). No reboot.
    Unlock     Removes the OESU policy keys set by Lock and re-enables
               the updater. Adobe's defaults come back.
+   Reboot     Schedules a restart in Delay seconds (default 60) with an
+              on-screen notice, then exits so the job records its result.
+              Use it when Check or Reinstall reports a pending reboot.
 
  Blank, missing or unrecognised Mode means Check, so a typo gives you a
  report and never a reinstall.
@@ -54,6 +57,11 @@
    KeepIfReader     Reinstall. Default true: if Check already shows
                     Reader mode (SCAPackageLevel 1) the reinstall is
                     skipped and only Lock runs. Set false to force it.
+   Force            Reinstall. Default false: a pending reboot stops the
+                    run before anything is uninstalled (the Adobe
+                    installer fails with 1603 on a PC that needs a
+                    reboot). true overrides that check.
+   Delay            Reboot. Seconds before the restart. Default 60.
 
  OUTPUT
    Line 1 is a banner. Machine readable lines start with BANNER|,
@@ -67,7 +75,7 @@
 $ErrorActionPreference = "Continue"
 
 $ScriptName = "OESU-AcrobatReader"
-$Version    = "1.2"
+$Version    = "1.3"
 $Dir        = "C:\ProgramData\OESU"
 $Log        = Join-Path $Dir "AcrobatReader.log"
 $Computer   = $env:COMPUTERNAME
@@ -83,7 +91,7 @@ function L([string]$m) {
 # ---------------------------------------------------------------- mode
 
 $RawMode = if ($env:Mode) { $env:Mode.Trim() } else { "" }
-$Valid   = @("Check", "Lock", "Reinstall", "Unlock")
+$Valid   = @("Check", "Lock", "Reinstall", "Unlock", "Reboot")
 $Mode    = ($Valid | Where-Object { $_ -ieq $RawMode } | Select-Object -First 1)
 
 $ModeNote = ""
@@ -96,6 +104,10 @@ if (-not $Mode) {
 $WhatIf         = ($env:WhatIf -eq "true")
 $DisableUpdater = ($env:DisableUpdater -eq "true")
 $KeepIfReader   = -not ($env:KeepIfReader -eq "false")
+$Force          = ($env:Force -eq "true")
+$Delay          = 60
+if ($env:Delay -match '^\d+$') { $Delay = [int]$env:Delay }
+if ($Delay -lt 15) { $Delay = 15 }
 # Full 64-bit Reader MUI installers live under /pub/adobe/acrobat/win/ (not /reader/),
 # which only holds the .msp patches. Candidates are tried in order; the first one that
 # downloads and carries a valid Adobe signature wins. InstallerUrl, if set, goes first.
@@ -179,6 +191,24 @@ function Remove-RegValue([string]$path, [string]$name) {
     if (Test-Path $path) { Remove-ItemProperty -Path $path -Name $name -ErrorAction SilentlyContinue }
 }
 
+function Get-PendingRebootReasons {
+    $r = @()
+    if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") { $r += "CBS" }
+    if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") { $r += "WindowsUpdate" }
+    $pfr = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
+    if ($pfr) { $r += "PendingFileRename" }
+    return $r
+}
+
+function Do-Reboot {
+    if (Would "Restart this computer in $Delay seconds") {
+        shutdown.exe /r /t $Delay /c "OESU Tech: restarting to finish the Adobe Reader repair. Save your work." /d p:4:1
+        Write-Host "RESULT|$Computer|reboot|scheduled|$Delay"
+    } else {
+        Write-Host "RESULT|$Computer|reboot|skipped|whatif"
+    }
+}
+
 # --------------------------------------------------------------- check
 
 function Show-Check {
@@ -243,6 +273,10 @@ function Show-Check {
     $bView = Get-RegDword $IpmKey  "bDontShowMsgWhenViewingDoc"
     L ("Policy keys: bUpdater={0} bAcroSuppressUpsell={1} bProtectedMode={2} cIPM\bShowMsgAtLaunch={3} cIPM\bDontShowMsgWhenViewingDoc={4}" -f $bUpd, $bUps, $bPM, $bLnch, $bView)
     Write-Host "STATUS|$Computer|policy|bUpdater=$bUpd;bAcroSuppressUpsell=$bUps;bProtectedMode=$bPM;bShowMsgAtLaunch=$bLnch;bDontShowMsgWhenViewingDoc=$bView"
+
+    $pr = Get-PendingRebootReasons
+    L ("Pending reboot: " + $(if ($pr) { $pr -join ", " } else { "none" }))
+    Write-Host ("STATUS|$Computer|pending_reboot|" + $(if ($pr) { $pr -join "+" } else { "none" }))
 
     # Windows Controlled Folder Access (blocks unknown apps from writing to Documents and Desktop)
     try {
@@ -361,6 +395,20 @@ function Do-Reinstall {
         return
     }
 
+    # 0. A pending reboot makes the Adobe installer fail with 1603 after the uninstall has
+    #    already happened, leaving the PC with no PDF app. Refuse unless Force=true.
+    $pending = Get-PendingRebootReasons
+    if ($pending) {
+        L ("Pending reboot detected: " + ($pending -join ", "))
+        Write-Host "STATUS|$Computer|pending_reboot|$($pending -join '+')"
+        if (-not $Force) {
+            L "Reinstall refused: reboot this PC first, then rerun. Pass Force=true to override (the install will probably fail with 1603)."
+            Write-Host "RESULT|$Computer|reinstall|refused|pending_reboot"
+            exit 1
+        }
+        L "Force=true: continuing despite the pending reboot."
+    }
+
     # 1. Download the installer first, so a failed download never leaves the PC with no PDF reader.
     $dl = Join-Path $Dir ("AcroRdr_" + (Get-Date -Format 'yyyyMMddHHmm') + ".exe")
     if (Would "Download a Reader installer (trying $($InstallerCandidates.Count) known URL(s) in order)") {
@@ -424,16 +472,27 @@ function Do-Reinstall {
         }
     }
 
-    # 3. Install Reader silently. /sAll = silent, /rs = suppress reboot, /msi passes MSI properties.
+    # 3. Install Reader silently. /sAll = silent, /rs = suppress reboot, /msi passes MSI properties
+    #    (including a verbose MSI log, so a failure explains itself).
     if (Would "Install Reader silently from $dl") {
-        $instArgs = "/sAll /rs /rps /msi EULA_ACCEPT=YES DISABLEDESKTOPSHORTCUT=1"
+        $msiLog = Join-Path $Dir "AcroRdrInstall.log"
+        Remove-Item $msiLog -Force -ErrorAction SilentlyContinue
+        $instArgs = "/sAll /rs /rps /msi EULA_ACCEPT=YES DISABLEDESKTOPSHORTCUT=1 /L*v `"$msiLog`""
         $p = Start-Process -FilePath $dl -ArgumentList $instArgs -Wait -PassThru
         L ("  install exit code {0} (0 or 3010 is fine)" -f $p.ExitCode)
-        Remove-Item $dl -Force -ErrorAction SilentlyContinue
         $m2 = Get-AdobeMode
         $new = Get-AdobeInstalls | Where-Object { $_.Name -match '^Adobe (Acrobat|Reader)' } | Select-Object -First 1
         L ("  now installed: {0} {1}, mode {2}" -f $(if ($new) { $new.Name } else { 'nothing' }), $(if ($new) { $new.Version } else { '' }), $m2.Mode)
         Write-Host "RESULT|$Computer|reinstall|exit$($p.ExitCode)|$($m2.Mode)|$(if ($new) { $new.Version } else { 'missing' })"
+        if ($new) {
+            Remove-Item $dl -Force -ErrorAction SilentlyContinue
+        } else {
+            L "  Install did not take. Installer kept at $dl for a rerun; MSI log at $msiLog."
+            if (Test-Path $msiLog) {
+                $why = Select-String -Path $msiLog -Pattern 'Return value 3|error 1603|pending|reboot|MainEngineThread is returning' -ErrorAction SilentlyContinue | Select-Object -First 8
+                foreach ($w in $why) { L ("  log: " + $w.Line.Trim()) }
+            }
+        }
     } else {
         Write-Host "RESULT|$Computer|reinstall|whatif"
     }
@@ -452,6 +511,7 @@ switch ($Mode) {
     "Lock"      { Do-Lock }
     "Unlock"    { Do-Unlock }
     "Reinstall" { Do-Reinstall }
+    "Reboot"    { Do-Reboot }
 }
 
 Write-Host ""
