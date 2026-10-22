@@ -1,7 +1,7 @@
 <#
 =======================================================================
  OESU-AcrobatReader.ps1
- Version 1.1  (2026-10-22)
+ Version 1.2  (2026-10-22)
 
  Diagnoses and repairs the "Adobe can't save PDFs / keeps asking me to
  sign in" problem seen at OESU in Sept and Oct 2026 (Jen in HR, Mae,
@@ -67,7 +67,7 @@
 $ErrorActionPreference = "Continue"
 
 $ScriptName = "OESU-AcrobatReader"
-$Version    = "1.1"
+$Version    = "1.2"
 $Dir        = "C:\ProgramData\OESU"
 $Log        = Join-Path $Dir "AcrobatReader.log"
 $Computer   = $env:COMPUTERNAME
@@ -365,16 +365,24 @@ function Do-Reinstall {
     $dl = Join-Path $Dir ("AcroRdr_" + (Get-Date -Format 'yyyyMMddHHmm') + ".exe")
     if (Would "Download a Reader installer (trying $($InstallerCandidates.Count) known URL(s) in order)") {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        # Invoke-WebRequest crawls on files this size (it renders a progress record per
+        # chunk). WebClient streams straight to disk at line speed.
+        $ProgressPreference = "SilentlyContinue"
         $got = $false
         foreach ($url in $InstallerCandidates) {
             L "Trying $url"
             Remove-Item $dl -Force -ErrorAction SilentlyContinue
+            $t0 = Get-Date
             try {
-                Invoke-WebRequest -Uri $url -OutFile $dl -UseBasicParsing -TimeoutSec 900
+                $wc = New-Object System.Net.WebClient
+                $wc.Headers.Add("User-Agent", "OESU-AcrobatReader/$Version")
+                $wc.DownloadFile($url, $dl)
+                $wc.Dispose()
             } catch {
                 L "  download failed: $($_.Exception.Message)"
                 continue
             }
+            L ("  downloaded in {0:N0} s" -f ((Get-Date) - $t0).TotalSeconds)
             $size = (Get-Item $dl -ErrorAction SilentlyContinue).Length
             if (-not $size -or $size -lt 100MB) {
                 L "  file is only $size bytes, not a full installer; skipping"
